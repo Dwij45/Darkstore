@@ -35,7 +35,7 @@ type Dispatcher interface {
 }
 
 type Server struct {
-	inv      *inventory.Store
+	inv      inventory.Inventory
 	dispatch Dispatcher
 	tracker  *fulfilment.Tracker
 	limiter  *ratelimit.Limiter
@@ -56,7 +56,7 @@ func WithIdempotencyTTL(d time.Duration) Option {
 }
 
 // New wires the routes. dispatch and tracker may be nil.
-func New(inv *inventory.Store, dispatch Dispatcher, tracker *fulfilment.Tracker, opts ...Option) *Server {
+func New(inv inventory.Inventory, dispatch Dispatcher, tracker *fulfilment.Tracker, opts ...Option) *Server {
 	s := &Server{
 		inv:      inv,
 		dispatch: dispatch,
@@ -126,7 +126,23 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStock(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.inv.Stock())
+	stock, err := s.inv.Stock(r.Context())
+	if err != nil {
+		writeOrderError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stock)
+}
+
+// opTimeout bounds one stock operation. The operation is detached from the
+// request's cancellation (see opContext), so this is its only deadline.
+const opTimeout = 5 * time.Second
+
+// opContext returns a context for a stock write that keeps running if the
+// client disconnects mid-request: a reservation should either finish or fail
+// cleanly, not be abandoned half way because a socket closed.
+func opContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), opTimeout)
 }
 
 func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +179,8 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	fp := sha256.Sum256(canonical)
 
 	// Keys are scoped per user so two users cannot collide on the same key.
-	e, owner, err := s.idem.begin(req.UserID+":"+key, fp)
+	idemKey := req.UserID + ":" + key
+	e, owner, err := s.idem.begin(idemKey, fp)
 	if err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, errorResponse{Error: err.Error()})
 		return
@@ -180,14 +197,21 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request) {
 
 	// Every outcome is stored, including 409s: a retry of a request that found
 	// no stock gets the same answer rather than a surprise success later.
-	status, payload := s.checkout(req)
+	// The exception is a server error: a database hiccup must not be replayed
+	// for the life of the key, so it is forgotten and the next retry runs fresh.
+	ctx, cancel := opContext(r)
+	defer cancel()
+	status, payload := s.checkout(ctx, req)
 	body, _ := json.Marshal(payload)
+	if status >= http.StatusInternalServerError {
+		s.idem.forget(idemKey, e)
+	}
 	s.idem.finish(e, status, body)
 	writeRaw(w, status, body)
 }
 
-func (s *Server) checkout(req checkoutRequest) (int, any) {
-	res, err := s.inv.Reserve(req.Items)
+func (s *Server) checkout(ctx context.Context, req checkoutRequest) (int, any) {
+	res, err := s.inv.Reserve(ctx, req.Items)
 	var oos *inventory.OutOfStockError
 	switch {
 	case err == nil:
@@ -204,7 +228,7 @@ func (s *Server) checkout(req checkoutRequest) (int, any) {
 }
 
 func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
-	res, err := s.inv.Get(r.PathValue("id"))
+	res, err := s.inv.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeOrderError(w, err)
 		return
@@ -213,7 +237,9 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
-	res, err := s.inv.Confirm(r.PathValue("id"))
+	ctx, cancel := opContext(r)
+	defer cancel()
+	res, err := s.inv.Confirm(ctx, r.PathValue("id"))
 	if err != nil {
 		writeOrderError(w, err)
 		return
@@ -248,7 +274,9 @@ func (s *Server) withFulfilment(o orderResponse) orderResponse {
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
-	res, err := s.inv.Release(r.PathValue("id"))
+	ctx, cancel := opContext(r)
+	defer cancel()
+	res, err := s.inv.Release(ctx, r.PathValue("id"))
 	if err != nil {
 		writeOrderError(w, err)
 		return

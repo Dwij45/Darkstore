@@ -61,6 +61,16 @@ func (c *idempotencyCache) begin(key string, fp [sha256.Size]byte) (e *idemEntry
 	return e, true, nil
 }
 
+// forget removes e's entry so the next request with the same key runs afresh.
+// Requests already waiting on e still receive its response.
+func (c *idempotencyCache) forget(key string, e *idemEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries[key] == e {
+		delete(c.entries, key)
+	}
+}
+
 func (c *idempotencyCache) finish(e *idemEntry, status int, body []byte) {
 	c.mu.Lock()
 	e.finishedAt = c.now()

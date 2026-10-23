@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func newTestServer(t *testing.T, ttl time.Duration, stock map[string]int) (*Serv
 		}
 	}
 	d := &fakeDispatcher{}
-	return New(inv, d, fulfilment.NewTracker()), inv, d
+	return New(inventory.AsInventory(inv), d, fulfilment.NewTracker()), inv, d
 }
 
 func do(s *Server, method, path, key, body string) *httptest.ResponseRecorder {
@@ -278,7 +279,7 @@ func TestCheckoutIsRateLimitedPerUser(t *testing.T) {
 	inv := inventory.NewStore(time.Minute)
 	inv.AddStock("milk", 100)
 	// Frozen refill: a burst of 3 and nothing more.
-	s := New(inv, nil, nil, WithRateLimiter(ratelimit.New(0.000001, 3)))
+	s := New(inventory.AsInventory(inv), nil, nil, WithRateLimiter(ratelimit.New(0.000001, 3)))
 
 	for i := range 3 {
 		rec := do(s, "POST", "/checkout", fmt.Sprintf("a%d", i), `{"user_id":"alice","items":[{"sku":"milk","qty":1}]}`)
@@ -310,7 +311,7 @@ func TestRateLimitedResponseIsNotStoredAgainstTheKey(t *testing.T) {
 	inv := inventory.NewStore(time.Minute)
 	inv.AddStock("milk", 10)
 	lim := ratelimit.New(1000, 1) // one token, refills almost at once
-	s := New(inv, nil, nil, WithRateLimiter(lim))
+	s := New(inventory.AsInventory(inv), nil, nil, WithRateLimiter(lim))
 
 	body := `{"user_id":"u","items":[{"sku":"milk","qty":1}]}`
 	do(s, "POST", "/checkout", "first", body) // spends the only token
@@ -364,5 +365,49 @@ func TestExpiredKeyIsReusableWithoutASweep(t *testing.T) {
 	// A different body is fine once the old entry has expired.
 	if _, owner, err := c.begin("k", [32]byte{2}); !owner || err != nil {
 		t.Errorf("owner=%v err=%v, want a fresh owner with no error", owner, err)
+	}
+}
+
+// flakyInventory fails Reserve while down is set, like a database outage.
+type flakyInventory struct {
+	inventory.Inventory
+	down atomic.Bool
+}
+
+func (f *flakyInventory) Reserve(ctx context.Context, items []inventory.Item) (inventory.Reservation, error) {
+	if f.down.Load() {
+		return inventory.Reservation{}, errors.New("connection refused")
+	}
+	return f.Inventory.Reserve(ctx, items)
+}
+
+// A server error must not be replayed for the life of the key: once the
+// backend recovers, the client's retry has to run again.
+func TestServerErrorIsNotStoredAgainstTheKey(t *testing.T) {
+	store := inventory.NewStore(time.Minute)
+	store.AddStock("milk", 10)
+	flaky := &flakyInventory{Inventory: inventory.AsInventory(store)}
+	s := New(flaky, nil, nil)
+
+	flaky.down.Store(true)
+	if rec := do(s, "POST", "/checkout", "k", milkx2); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("while down: status = %d, want 500", rec.Code)
+	}
+
+	flaky.down.Store(false)
+	retry := do(s, "POST", "/checkout", "k", milkx2)
+	if retry.Code != http.StatusCreated {
+		t.Fatalf("after recovery: status = %d, want 201 (the 500 must not be replayed)", retry.Code)
+	}
+	if retry.Header().Get("Idempotent-Replayed") == "true" {
+		t.Error("retry was served from the cache; it should have run afresh")
+	}
+
+	again := do(s, "POST", "/checkout", "k", milkx2)
+	if again.Header().Get("Idempotent-Replayed") != "true" || decodeOrder(t, again).OrderID != decodeOrder(t, retry).OrderID {
+		t.Error("a successful result should be replayed as usual")
+	}
+	if n, _ := store.Available("milk"); n != 8 {
+		t.Errorf("available = %d, want 8 (stock taken once)", n)
 	}
 }
