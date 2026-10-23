@@ -146,3 +146,47 @@ powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1 -Count 10
 | `go test -race -count=10 ./...` | PASS in all 4 packages (every test, including the 1,000-vs-50 checkout tests, run 10 times) |
 
 The first run took ~7 minutes (image download); later runs take under 30 seconds because modules and build output are cached in Docker volumes.
+
+## Step 5 — Rate limiting and idempotency expiry (`internal/ratelimit`, `internal/api`)
+
+Date: 2026-10-23
+
+### Run 1: unit tests
+
+| Test | What it proves | Result |
+|---|---|---|
+| `TestAllowsBurstThenRefuses` | A burst of 3 passes, the 4th is refused | PASS |
+| `TestRefillsOverTime` | Tokens come back at the configured rate (fake clock) | PASS |
+| `TestRefillIsCappedAtBurst` | A long idle period never banks more than the burst | PASS |
+| `TestRetryAfterTellsWhenToComeBack` | A refusal reports the wait until the next token (500ms at 2/s) | PASS |
+| `TestKeysAreIndependent` | One user's limit does not affect another | PASS |
+| `TestConcurrentRequestsNeverExceedBurst` | 1,000 simultaneous attempts against a burst of 50: exactly 50 pass | PASS |
+| `TestSweepDropsOnlyFullBuckets` | Sweep frees fully refilled buckets and keeps drained ones | PASS |
+| `TestZeroRateNeverRefills` | A zero rate never grants new tokens | PASS |
+| `TestCheckoutIsRateLimitedPerUser` | 4th checkout is `429` with `Retry-After`, takes no stock, and other users are unaffected | PASS |
+| `TestRateLimitedResponseIsNotStoredAgainstTheKey` | After a `429`, the same Idempotency-Key works once the user is allowed again | PASS |
+| `TestIdempotencyEntriesExpire` | In-flight entries are never swept; finished ones expire after the TTL | PASS |
+| `TestExpiredKeyIsReusableWithoutASweep` | An expired key is reusable even before the sweeper runs, and a different body is then accepted | PASS |
+
+Total: 43 tests across 5 packages.
+
+### Run 2: race detector
+
+```
+powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1 -Count 5
+```
+
+PASS in all 5 packages, no data races.
+
+### Run 3: live server
+
+Started with `RATE_BURST=3 RATE_PER_SEC=0.5`; one user sent 5 checkouts:
+
+```
+req 1 -> 201
+req 2 -> 201
+req 3 -> 201
+req 4 -> 429
+req 5 -> 429       (Retry-After: 2)
+another user -> 201
+```

@@ -24,9 +24,12 @@ Standard library only (`net/http`, `log/slog`, `sync`, `context`). No external d
 | Late payment is refused | `Confirm` checks the deadline itself, not just the background cleanup | Confirm after TTL returns `410 Gone` and stock is back |
 | A rider is never double-booked | Rider pool behind a mutex | 200 goroutines compete for 100 riders: each rider assigned exactly once |
 | No panic on shutdown | `Submit` and `Shutdown` coordinate through an `RWMutex` | 50 rounds of `Submit` racing `Shutdown` |
-| No data races | | Whole suite passes under `go test -race`, including with `-count=10` |
+| A user can't flood checkout | Per-user token bucket; refused requests get `429` with `Retry-After` | 1,000 simultaneous attempts against a burst of 50: exactly 50 pass. A refused request takes no stock |
+| A refused request doesn't poison its key | Rate limit is checked before the idempotency lookup, so a `429` is never stored | Retry with the same key after the cool-down succeeds |
+| Memory stays bounded | Idempotency entries expire after a TTL; idle rate-limit buckets are swept; in-flight entries are never dropped | Expiry tests with a fake clock |
+| No data races | | Whole suite passes under `go test -race`, including with `-count=5` and `-count=10` |
 
-31 tests. Results are logged in [docs/TESTING.md](docs/TESTING.md).
+43 tests. Results are logged in [docs/TESTING.md](docs/TESTING.md).
 
 ## Run it
 
@@ -44,6 +47,9 @@ Configuration is by environment variable:
 | `RESERVATION_TTL` | `2m` | How long checkout holds stock |
 | `WORKERS` | `4` | Fulfilment goroutines |
 | `QUEUE_SIZE` | `256` | Confirmed orders that can wait for a worker |
+| `RATE_PER_SEC` | `2` | Sustained checkouts per user per second |
+| `RATE_BURST` | `10` | Checkouts a user can make in a burst |
+| `IDEMPOTENCY_TTL` | `24h` | How long a checkout response can be replayed |
 
 The store starts with `milk-1l` (50), `bread-whole` (20), `eggs-12` (30) and `banana-6` (40).
 
@@ -58,7 +64,7 @@ The store starts with `milk-1l` (50), `bread-whole` (20), `eggs-12` (30) and `ba
 | `POST /orders/{id}/confirm` | Payment succeeded: sell the stock and start fulfilment |
 | `POST /orders/{id}/cancel` | Return the held stock |
 
-Status codes: `201` reserved, `409` out of stock or order already confirmed, `410` reservation expired, `422` invalid cart or key reused with a different body, `404` unknown order, `503` confirmed but the fulfilment queue is unavailable.
+Status codes: `201` reserved, `409` out of stock or order already confirmed, `410` reservation expired, `422` invalid cart or key reused with a different body, `429` too many checkouts from this user (see `Retry-After`), `404` unknown order, `503` confirmed but the fulfilment queue is unavailable.
 
 ```bash
 curl -X POST localhost:8080/checkout \
@@ -97,6 +103,7 @@ With the server running in another terminal, `scripts/smoke.ps1` exercises every
 cmd/server/            entrypoint: config, wiring, graceful shutdown
 internal/inventory/    stock, reservations, TTL expiry
 internal/api/          HTTP handlers, idempotency cache
+internal/ratelimit/    per-user token bucket
 internal/worker/       generic goroutine pool with backpressure and drain
 internal/fulfilment/   order stages, nearest-rider assignment
 scripts/               smoke test, race-detector runner
@@ -115,16 +122,18 @@ docs/TESTING.md        recorded test results
 
 This is a single-process, in-memory service, built to demonstrate the concurrency design. Be clear about what it is not:
 
-- **State is lost on restart.** Stock, reservations and idempotency keys live in memory. Idempotency entries are never evicted.
+- **State is lost on restart.** Stock, reservations, orders and idempotency keys live in memory, so it also cannot run as more than one instance. The fix is Postgres (see the roadmap).
 - **Confirm-then-enqueue is not atomic.** If payment is confirmed but the worker queue rejects the order, the API returns `503` and the order stays confirmed with nobody fulfilling it. The fix is an outbox: write the order event in the same transaction as the confirm and have workers poll it.
-- **No authentication, no rate limiting, no real payment step.** `user_id` is taken from the request body.
+- **No authentication and no real payment step.** `user_id` is taken from the request body, so the rate limit keys on a value the client controls. Behind real auth it would key on the authenticated identity.
+- **The rate limiter and idempotency cache are per-process.** With several instances each would need a shared store (Redis) to enforce limits globally.
 - **No benchmark numbers yet.** Throughput and latency under load have not been measured.
 
 ## Roadmap
 
 - [ ] PostgreSQL reservation using `SELECT ... FOR UPDATE`, and a Redis Lua-script version, benchmarked against the in-memory one
-- [ ] Persist orders and idempotency keys; expire old keys
+- [x] Per-user token-bucket rate limiting
+- [x] Expire old idempotency keys
+- [ ] Persist orders and idempotency keys
 - [ ] Outbox pattern so a confirmed order is never lost
-- [ ] Per-user token-bucket rate limiting
 - [ ] k6 load test with p95/p99 latency in this README
 - [ ] Prometheus metrics
