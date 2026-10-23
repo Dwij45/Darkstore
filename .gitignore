@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+*.exe
+/darkstore
+
+# Test and coverage output
+*.out
+*.test
+coverage.html
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
