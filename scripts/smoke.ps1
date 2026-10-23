@@ -1,11 +1,20 @@
-# Manual smoke test for a running server. Start the server first:
+# Manual smoke test for a running server. Start the server in one terminal:
 #   go run ./cmd/server
-# then in a second terminal:
+# then run this in a SECOND terminal (go run keeps the first one busy):
 #   powershell -ExecutionPolicy Bypass -File scripts/smoke.ps1
-param([string]$Base = "http://localhost:8080")
+# 127.0.0.1 rather than localhost: Windows PowerShell may resolve localhost to IPv6 first.
+param([string]$Base = "http://127.0.0.1:8080")
 
 $ErrorActionPreference = "Stop"
 $failures = 0
+
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri "$Base/healthz" -TimeoutSec 3 | Out-Null
+} catch {
+    Write-Host "Cannot reach the server at $Base." -ForegroundColor Red
+    Write-Host "Start it in another terminal with 'go run ./cmd/server' and leave it running, then re-run this script."
+    exit 2
+}
 
 function Call($Method, $Path, $Body = $null, $Key = $null) {
     $headers = @{}
