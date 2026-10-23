@@ -47,3 +47,41 @@ ok      darkstore/internal/inventory    0.812s
 ### Not yet covered
 
 - The race detector (`go test -race`) has not been run. On Windows it needs CGO and a C compiler, so it will run in Docker in step 4.
+
+## Step 2 — HTTP API with idempotency (`internal/api`, `cmd/server`)
+
+Date: 2026-10-23
+
+### Run 1: unit tests through the HTTP handler
+
+```
+go test -v ./internal/api
+```
+
+| Test | What it proves | Result |
+|---|---|---|
+| `TestCheckoutRequiresIdempotencyKey` | Checkout without an `Idempotency-Key` header is 400 | PASS |
+| `TestCheckoutValidatesBody` | Bad JSON, unknown fields, missing user are 400; unknown SKU and zero qty are 422 | PASS |
+| `TestRetriedCheckoutCreatesOneOrder` | A retry (even with different whitespace and field order) returns the same order, sets `Idempotent-Replayed: true`, and takes stock once | PASS |
+| `TestConcurrentDuplicateCheckoutsCreateOneOrder` | 50 copies of one request at the same moment produce one order | PASS |
+| `TestKeyReusedWithDifferentBodyIsRejected` | Same key with a different cart is 422 | PASS |
+| `TestSameKeyFromDifferentUsersIsIndependent` | Keys are scoped per user | PASS |
+| `TestConcurrentCheckoutsOverHTTPNeverOversell` | 1,000 concurrent HTTP checkouts against 50 units: exactly 50 × 201 and 950 × 409 | PASS |
+| `TestConfirmDispatchesOrder` | Confirm is 200, hands the order to the dispatcher, and a second confirm is 409 | PASS |
+| `TestConfirmReportsUnavailableQueue` | Confirm returns 503 if the fulfilment queue rejects the order | PASS |
+| `TestConfirmAfterExpiryIsGone` | Confirm after the TTL is 410 and the stock is returned | PASS |
+| `TestCancelReturnsStock` | Cancel is 200 / released and returns the stock | PASS |
+| `TestGetUnknownOrderIsNotFound` | Unknown order is 404 | PASS |
+
+### Run 2: live server smoke test
+
+```
+go run ./cmd/server
+powershell -ExecutionPolicy Bypass -File scripts/smoke.ps1
+```
+
+All 12 checks passed: health, checkout 201, retry returns the same order with the replay header, stock dropped by 2 not 4, key reuse 422, missing key 400, oversized cart 409, confirm 200, second confirm 409, cancel returns stock, unknown order 404.
+
+### Known gap
+
+- If payment is confirmed but the fulfilment queue is unavailable, the API returns 503 and the order stays confirmed with nobody working on it. The fix is an outbox (store the order event in the same transaction as the confirm, and have workers poll it).
