@@ -6,6 +6,9 @@
 //	RESERVATION_TTL  how long checkout holds stock, default 2m
 //	WORKERS          fulfilment goroutines, default 4
 //	QUEUE_SIZE       confirmed orders that can wait for a worker, default 256
+//	RATE_PER_SEC     sustained checkouts per user per second, default 2
+//	RATE_BURST       checkouts a user can make in a burst, default 10
+//	IDEMPOTENCY_TTL  how long a checkout response can be replayed, default 24h
 package main
 
 import (
@@ -23,6 +26,7 @@ import (
 	"darkstore/internal/api"
 	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
+	"darkstore/internal/ratelimit"
 	"darkstore/internal/worker"
 )
 
@@ -47,6 +51,19 @@ func run(log *slog.Logger) error {
 	queueSize, err := strconv.Atoi(envOr("QUEUE_SIZE", "256"))
 	if err != nil {
 		return fmt.Errorf("QUEUE_SIZE: %w", err)
+	}
+
+	ratePerSec, err := strconv.ParseFloat(envOr("RATE_PER_SEC", "2"), 64)
+	if err != nil {
+		return fmt.Errorf("RATE_PER_SEC: %w", err)
+	}
+	burst, err := strconv.Atoi(envOr("RATE_BURST", "10"))
+	if err != nil {
+		return fmt.Errorf("RATE_BURST: %w", err)
+	}
+	idemTTL, err := time.ParseDuration(envOr("IDEMPOTENCY_TTL", "24h"))
+	if err != nil {
+		return fmt.Errorf("IDEMPOTENCY_TTL: %w", err)
 	}
 
 	inv := inventory.NewStore(ttl)
@@ -82,9 +99,15 @@ func run(log *slog.Logger) error {
 
 	go inv.RunJanitor(ctx, time.Second)
 
+	handler := api.New(inv, pool, tracker,
+		api.WithRateLimiter(ratelimit.New(ratePerSec, burst)),
+		api.WithIdempotencyTTL(idemTTL),
+	)
+	go handler.RunMaintenance(ctx, time.Minute)
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.New(inv, pool, tracker),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	serveErr := make(chan error, 1)

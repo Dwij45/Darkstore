@@ -13,12 +13,18 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
+	"darkstore/internal/ratelimit"
 )
+
+// defaultIdempotencyTTL is how long a checkout response can be replayed.
+const defaultIdempotencyTTL = 24 * time.Hour
 
 const maxBodyBytes = 64 << 10
 
@@ -32,18 +38,34 @@ type Server struct {
 	inv      *inventory.Store
 	dispatch Dispatcher
 	tracker  *fulfilment.Tracker
+	limiter  *ratelimit.Limiter
 	idem     *idempotencyCache
 	mux      *http.ServeMux
 }
 
+type Option func(*Server)
+
+// WithRateLimiter limits checkout attempts per user. Without it checkout is unlimited.
+func WithRateLimiter(l *ratelimit.Limiter) Option {
+	return func(s *Server) { s.limiter = l }
+}
+
+// WithIdempotencyTTL sets how long a checkout response can be replayed.
+func WithIdempotencyTTL(d time.Duration) Option {
+	return func(s *Server) { s.idem.ttl = d }
+}
+
 // New wires the routes. dispatch and tracker may be nil.
-func New(inv *inventory.Store, dispatch Dispatcher, tracker *fulfilment.Tracker) *Server {
+func New(inv *inventory.Store, dispatch Dispatcher, tracker *fulfilment.Tracker, opts ...Option) *Server {
 	s := &Server{
 		inv:      inv,
 		dispatch: dispatch,
 		tracker:  tracker,
-		idem:     newIdempotencyCache(),
+		idem:     newIdempotencyCache(defaultIdempotencyTTL),
 		mux:      http.NewServeMux(),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /stock", s.handleStock)
@@ -56,6 +78,24 @@ func New(inv *inventory.Store, dispatch Dispatcher, tracker *fulfilment.Tracker)
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
+}
+
+// RunMaintenance forgets expired idempotency keys and idle rate-limit buckets
+// every interval until ctx is cancelled.
+func (s *Server) RunMaintenance(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.idem.sweep()
+			if s.limiter != nil {
+				s.limiter.Sweep()
+			}
+		}
+	}
 }
 
 type checkoutRequest struct {
@@ -105,6 +145,16 @@ func (s *Server) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	if req.UserID == "" {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "user_id is required"})
 		return
+	}
+
+	// Limit before the idempotency lookup: a 429 must never be stored and
+	// replayed as the answer for this key. Replays count against the limit too.
+	if s.limiter != nil {
+		if ok, wait := s.limiter.Allow(req.UserID); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(wait.Seconds())))))
+			writeJSON(w, http.StatusTooManyRequests, errorResponse{Error: "too many checkout attempts, slow down"})
+			return
+		}
 	}
 
 	// Fingerprint the decoded request, not the raw bytes, so whitespace or

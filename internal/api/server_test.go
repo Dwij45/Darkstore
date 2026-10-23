@@ -14,6 +14,7 @@ import (
 
 	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
+	"darkstore/internal/ratelimit"
 )
 
 type fakeDispatcher struct {
@@ -270,5 +271,98 @@ func TestGetUnknownOrderIsNotFound(t *testing.T) {
 	s, _, _ := newTestServer(t, time.Minute, nil)
 	if rec := do(s, "GET", "/orders/nope", "", ""); rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestCheckoutIsRateLimitedPerUser(t *testing.T) {
+	inv := inventory.NewStore(time.Minute)
+	inv.AddStock("milk", 100)
+	// Frozen refill: a burst of 3 and nothing more.
+	s := New(inv, nil, nil, WithRateLimiter(ratelimit.New(0.000001, 3)))
+
+	for i := range 3 {
+		rec := do(s, "POST", "/checkout", fmt.Sprintf("a%d", i), `{"user_id":"alice","items":[{"sku":"milk","qty":1}]}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("request %d status = %d, want 201", i+1, rec.Code)
+		}
+	}
+	rec := do(s, "POST", "/checkout", "a3", `{"user_id":"alice","items":[{"sku":"milk","qty":1}]}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("4th request status = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("429 response is missing Retry-After")
+	}
+	if n, _ := inv.Available("milk"); n != 97 {
+		t.Errorf("available = %d, want 97 (the refused request must not take stock)", n)
+	}
+
+	// Another user is unaffected.
+	rec = do(s, "POST", "/checkout", "b0", `{"user_id":"bob","items":[{"sku":"milk","qty":1}]}`)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("bob's status = %d, want 201", rec.Code)
+	}
+}
+
+// A refused request must not poison its Idempotency-Key: once the user is
+// allowed again, the same key has to work.
+func TestRateLimitedResponseIsNotStoredAgainstTheKey(t *testing.T) {
+	inv := inventory.NewStore(time.Minute)
+	inv.AddStock("milk", 10)
+	lim := ratelimit.New(1000, 1) // one token, refills almost at once
+	s := New(inv, nil, nil, WithRateLimiter(lim))
+
+	body := `{"user_id":"u","items":[{"sku":"milk","qty":1}]}`
+	do(s, "POST", "/checkout", "first", body) // spends the only token
+	if rec := do(s, "POST", "/checkout", "retry-me", body); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if rec := do(s, "POST", "/checkout", "retry-me", body); rec.Code != http.StatusCreated {
+		t.Errorf("retry after cool-down status = %d, want 201", rec.Code)
+	}
+}
+
+func TestIdempotencyEntriesExpire(t *testing.T) {
+	c := newIdempotencyCache(time.Hour)
+	now := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return now }
+	fp := [32]byte{1}
+
+	e, owner, _ := c.begin("k", fp)
+	if !owner {
+		t.Fatal("first begin should own the key")
+	}
+	if n := c.sweep(); n != 0 || c.size() != 1 {
+		t.Fatalf("an in-flight entry must never be swept (swept %d, size %d)", n, c.size())
+	}
+	c.finish(e, 201, []byte("{}"))
+
+	now = now.Add(30 * time.Minute)
+	if _, owner, _ := c.begin("k", fp); owner {
+		t.Error("within the ttl, begin should replay, not own the key")
+	}
+
+	now = now.Add(31 * time.Minute)
+	if n := c.sweep(); n != 1 || c.size() != 0 {
+		t.Errorf("after the ttl swept %d, size %d; want 1, 0", n, c.size())
+	}
+	if _, owner, _ := c.begin("k", fp); !owner {
+		t.Error("after the ttl the key should be usable as a new request")
+	}
+}
+
+func TestExpiredKeyIsReusableWithoutASweep(t *testing.T) {
+	c := newIdempotencyCache(time.Minute)
+	now := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return now }
+
+	e, _, _ := c.begin("k", [32]byte{1})
+	c.finish(e, 201, nil)
+	now = now.Add(2 * time.Minute)
+
+	// A different body is fine once the old entry has expired.
+	if _, owner, err := c.begin("k", [32]byte{2}); !owner || err != nil {
+		t.Errorf("owner=%v err=%v, want a fresh owner with no error", owner, err)
 	}
 }
