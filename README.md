@@ -1,0 +1,130 @@
+# Darkstore
+
+An inventory-reservation and order service for a quick-commerce dark store, written in Go.
+
+The problem it targets: a dark store holds a few dozen units of an item, and hundreds of people check out at the same moment. The service must never sell the same unit twice, must not let a retried request create a second order, and must release stock when a customer abandons checkout.
+
+Standard library only (`net/http`, `log/slog`, `sync`, `context`). No external dependencies.
+
+## What it does
+
+1. **Checkout** reserves stock for every item in the cart, or for none of them, and holds it for a limited time (default 2 minutes).
+2. **Confirm** (payment succeeded) turns the hold into a sale and hands the order to a pool of workers.
+3. **Cancel**, or letting the hold expire, returns the stock.
+4. Workers move each order through `picking → packed → awaiting_rider → out_for_delivery → delivered`, assigning the nearest free rider.
+
+## Guarantees, and how they are tested
+
+| Guarantee | How | Test |
+|---|---|---|
+| Never oversell | One mutex guards stock and reservations; all cart lines are checked before any stock is taken | 1,000 goroutines race for 50 units: exactly 50 succeed, 950 are rejected, stock ends at 0. Repeated through the HTTP layer. |
+| A cart is all-or-nothing | Validate every line first, then take stock | A cart that fails on its second item holds nothing for its first |
+| A retried checkout makes one order | `Idempotency-Key` header; the first response is stored and replayed | A retry returns the same order; 50 simultaneous duplicates produce one order |
+| A key can't be abused | Request body is fingerprinted; keys are scoped per user | Same key with a different cart: `422`. Same key from two users: independent |
+| Late payment is refused | `Confirm` checks the deadline itself, not just the background cleanup | Confirm after TTL returns `410 Gone` and stock is back |
+| A rider is never double-booked | Rider pool behind a mutex | 200 goroutines compete for 100 riders: each rider assigned exactly once |
+| No panic on shutdown | `Submit` and `Shutdown` coordinate through an `RWMutex` | 50 rounds of `Submit` racing `Shutdown` |
+| No data races | | Whole suite passes under `go test -race`, including with `-count=10` |
+
+31 tests. Results are logged in [docs/TESTING.md](docs/TESTING.md).
+
+## Run it
+
+Requires Go 1.22 or newer (method-and-path routing).
+
+```bash
+go run ./cmd/server
+```
+
+Configuration is by environment variable:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ADDR` | `:8080` | Listen address |
+| `RESERVATION_TTL` | `2m` | How long checkout holds stock |
+| `WORKERS` | `4` | Fulfilment goroutines |
+| `QUEUE_SIZE` | `256` | Confirmed orders that can wait for a worker |
+
+The store starts with `milk-1l` (50), `bread-whole` (20), `eggs-12` (30) and `banana-6` (40).
+
+## API
+
+| Method and path | Purpose |
+|---|---|
+| `GET /healthz` | Liveness check |
+| `GET /stock` | Available quantity per SKU |
+| `POST /checkout` | Reserve stock. Requires an `Idempotency-Key` header |
+| `GET /orders/{id}` | Order status and fulfilment stage |
+| `POST /orders/{id}/confirm` | Payment succeeded: sell the stock and start fulfilment |
+| `POST /orders/{id}/cancel` | Return the held stock |
+
+Status codes: `201` reserved, `409` out of stock or order already confirmed, `410` reservation expired, `422` invalid cart or key reused with a different body, `404` unknown order, `503` confirmed but the fulfilment queue is unavailable.
+
+```bash
+curl -X POST localhost:8080/checkout \
+  -H "Idempotency-Key: order-1001" \
+  -d '{"user_id":"u1","items":[{"sku":"milk-1l","qty":2}]}'
+```
+
+```json
+{"order_id":"c6269baadbb04ccc","status":"pending","items":[{"sku":"milk-1l","qty":2}],"expires_at":"2026-10-23T13:41:38+05:30"}
+```
+
+Send the same request again and you get the same order back with an `Idempotent-Replayed: true` header, and stock is taken once.
+
+```bash
+curl -X POST localhost:8080/orders/c6269baadbb04ccc/confirm
+curl localhost:8080/orders/c6269baadbb04ccc
+```
+
+## Tests
+
+```bash
+go test ./...
+```
+
+The race detector needs CGO, which a plain Windows setup lacks, so `scripts/test-race.ps1` runs the suite in a `golang` container (Docker required):
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1
+```
+
+With the server running in another terminal, `scripts/smoke.ps1` exercises every endpoint end to end.
+
+## Layout
+
+```
+cmd/server/            entrypoint: config, wiring, graceful shutdown
+internal/inventory/    stock, reservations, TTL expiry
+internal/api/          HTTP handlers, idempotency cache
+internal/worker/       generic goroutine pool with backpressure and drain
+internal/fulfilment/   order stages, nearest-rider assignment
+scripts/               smoke test, race-detector runner
+docs/TESTING.md        recorded test results
+```
+
+## Design notes
+
+- **One mutex, not one per SKU.** A single lock is what makes a multi-item reservation atomic and keeps the code easy to reason about. The cost is that unrelated SKUs contend; per-SKU locks (with a fixed lock order to avoid deadlock) are the next step if profiling shows it matters.
+- **Idempotency stores every outcome, including failures.** A retry of a request that found no stock gets the same `409`, not a surprise success later.
+- **Backpressure over unbounded queues.** The worker queue is bounded. When it is full, confirm waits for space or the request times out, rather than memory growing without limit.
+- **Shutdown order.** Stop accepting HTTP requests first so nothing new is confirmed, then let workers finish accepted orders. If draining takes longer than 15 seconds, in-flight orders are cancelled through their `context` and riders are returned to the pool.
+- **Timeouts use a real deadline, not a timer per reservation.** A single janitor goroutine sweeps expired holds every second, and `Confirm` double-checks the deadline so a late payment never succeeds in the gap.
+
+## Known limitations
+
+This is a single-process, in-memory service, built to demonstrate the concurrency design. Be clear about what it is not:
+
+- **State is lost on restart.** Stock, reservations and idempotency keys live in memory. Idempotency entries are never evicted.
+- **Confirm-then-enqueue is not atomic.** If payment is confirmed but the worker queue rejects the order, the API returns `503` and the order stays confirmed with nobody fulfilling it. The fix is an outbox: write the order event in the same transaction as the confirm and have workers poll it.
+- **No authentication, no rate limiting, no real payment step.** `user_id` is taken from the request body.
+- **No benchmark numbers yet.** Throughput and latency under load have not been measured.
+
+## Roadmap
+
+- [ ] PostgreSQL reservation using `SELECT ... FOR UPDATE`, and a Redis Lua-script version, benchmarked against the in-memory one
+- [ ] Persist orders and idempotency keys; expire old keys
+- [ ] Outbox pattern so a confirmed order is never lost
+- [ ] Per-user token-bucket rate limiting
+- [ ] k6 load test with p95/p99 latency in this README
+- [ ] Prometheus metrics
