@@ -190,3 +190,51 @@ req 4 -> 429
 req 5 -> 429       (Retry-After: 2)
 another user -> 201
 ```
+
+## Step 5 — PostgreSQL stock backend (`internal/pgstore`, `internal/inventory` interface)
+
+Date: 2026-10-23
+
+Stock and reservations can now live in PostgreSQL (`DATABASE_URL`). The API depends on the `inventory.Inventory` interface; the in-memory store and the PostgreSQL store both implement it. Tests run against a real database (`docker compose up -d`, then `TEST_DATABASE_URL=postgres://darkstore:darkstore@localhost:5433/darkstore`); each test uses its own schema.
+
+### Run 1: PostgreSQL store tests
+
+| Test | What it proves | Result |
+|---|---|---|
+| `TestReserveNeverOversells` | 1,000 goroutines race for 50 units on a real database: exactly 50 succeed, 950 rejected, stock ends at 0 | PASS |
+| `TestOpposingCartsDoNotDeadlock` | 800 carts in opposite SKU orders (`[a,b]` and `[b,a]`) from 16 goroutines finish with exact stock and no deadlock | PASS |
+| `TestConfirmAndReleaseRaceSettleOnce` | 20 rounds of simultaneous confirm and cancel: exactly one wins and stock matches the winner | PASS |
+| `TestReserveIsAllOrNothing` / `MergesDuplicateLines` / `RejectsBadInput` | Same contract as the in-memory store | PASS |
+| `TestExpiredReservationReturnsStock` / `TestConfirmAfterDeadlineExpiresImmediately` | The janitor and a late confirm both return stock, and the expiry is committed | PASS |
+| `TestReleaseReturnsStockOnce` / `TestConfirmedStockStaysSold` | No double release; a sale cannot be released | PASS |
+| `TestSeedDoesNotInflateExistingStock` | Re-seeding on restart does not reset stock | PASS |
+| `TestReservationSurvivesRestart` | A new store over the same database sees and settles an earlier reservation | PASS |
+| `TestDatabaseRefusesNegativeStock` | The `CHECK (available >= 0)` constraint rejects a direct negative update | PASS |
+| `TestGetUnknownReservation` | Unknown id returns `ErrNotFound` | PASS |
+
+14 PostgreSQL tests. API test added: `TestServerErrorIsNotStoredAgainstTheKey` (a 5xx is not replayed for the life of an idempotency key; confirmed to fail when the fix is removed). Total: 58 tests.
+
+### Run 2: whole suite, native and under the race detector
+
+```
+TEST_DATABASE_URL=... go test ./...
+TEST_DATABASE_URL=... powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1 -Count 3
+```
+
+PASS in all 6 packages; no data races, including the PostgreSQL tests (3 runs of every test, 104 s for `pgstore`).
+
+### Run 3: live server on PostgreSQL, with a restart
+
+Placed an order for 3 `eggs-12` (stock 30 to 27), stopped the server, started it again:
+
+```
+stock after restart:   eggs-12 = 27, milk-1l = 45   (not re-seeded to 30 and 50)
+order after restart:   still pending, items intact
+confirm after restart: confirmed, then delivered by rider-1
+```
+
+### Known gaps
+
+- Idempotency keys, the fulfilment tracker and the worker queue are still in memory.
+- If the connection drops after the database commits but before the response arrives, a retry creates a second reservation and the first expires on its TTL. Storing the idempotency key in the same transaction would close this.
+- No benchmark yet comparing in-memory and PostgreSQL throughput.
