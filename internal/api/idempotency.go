@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"sync"
+	"time"
 )
 
 var errKeyReused = errors.New("idempotency key reused with a different request body")
@@ -15,21 +16,29 @@ type idemEntry struct {
 	done        chan struct{}
 	status      int
 	body        []byte
+	finishedAt  time.Time
 }
 
 // idempotencyCache replays the first response for a given key. Requests that
 // arrive while the first one is still running wait for it instead of racing
 // it, so a client retry can never create a second order.
 //
-// Entries are kept for the life of the process; a real deployment would
-// expire them (e.g. after 24h) and store them in Redis or Postgres.
+// A finished entry is kept for ttl and then forgotten, so memory is bounded.
+// An entry still in flight is never dropped. The cache is in memory; a
+// multi-instance deployment would store it in Redis or Postgres.
 type idempotencyCache struct {
 	mu      sync.Mutex
 	entries map[string]*idemEntry
+	ttl     time.Duration
+	now     func() time.Time
 }
 
-func newIdempotencyCache() *idempotencyCache {
-	return &idempotencyCache{entries: make(map[string]*idemEntry)}
+func newIdempotencyCache(ttl time.Duration) *idempotencyCache {
+	return &idempotencyCache{
+		entries: make(map[string]*idemEntry),
+		ttl:     ttl,
+		now:     time.Now,
+	}
 }
 
 // begin returns the entry for key. owner is true when the caller is the first
@@ -39,10 +48,13 @@ func (c *idempotencyCache) begin(key string, fp [sha256.Size]byte) (e *idemEntry
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
-		if e.fingerprint != fp {
-			return nil, false, errKeyReused
+		if !c.expired(e) {
+			if e.fingerprint != fp {
+				return nil, false, errKeyReused
+			}
+			return e, false, nil
 		}
-		return e, false, nil
+		delete(c.entries, key) // too old to replay: treat this as a new request
 	}
 	e = &idemEntry{fingerprint: fp, done: make(chan struct{})}
 	c.entries[key] = e
@@ -50,7 +62,38 @@ func (c *idempotencyCache) begin(key string, fp [sha256.Size]byte) (e *idemEntry
 }
 
 func (c *idempotencyCache) finish(e *idemEntry, status int, body []byte) {
+	c.mu.Lock()
+	e.finishedAt = c.now()
+	c.mu.Unlock()
 	e.status = status
 	e.body = body
 	close(e.done)
+}
+
+// sweep removes finished entries older than the ttl and reports how many.
+func (c *idempotencyCache) sweep() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for key, e := range c.entries {
+		if c.expired(e) {
+			delete(c.entries, key)
+			n++
+		}
+	}
+	return n
+}
+
+func (c *idempotencyCache) size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// expired is true only for a finished entry past its ttl. Callers hold c.mu.
+func (c *idempotencyCache) expired(e *idemEntry) bool {
+	if c.ttl <= 0 || e.finishedAt.IsZero() {
+		return false
+	}
+	return c.now().Sub(e.finishedAt) >= c.ttl
 }
