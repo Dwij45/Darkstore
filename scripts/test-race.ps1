@@ -15,12 +15,21 @@ if ($LASTEXITCODE -ne 0) {
 
 $root = Split-Path -Parent $PSScriptRoot
 
+# PostgreSQL tests run when TEST_DATABASE_URL is set. From inside the container
+# the host's localhost is host.docker.internal.
+$dbArgs = @()
+if ($env:TEST_DATABASE_URL) {
+    $url = $env:TEST_DATABASE_URL -replace '@(localhost|127\.0\.0\.1)', '@host.docker.internal'
+    $dbArgs = @('-e', "TEST_DATABASE_URL=$url")
+}
+
 # Named volumes cache modules and build output between runs, so only the first run is slow.
 docker run --rm `
     -v "${root}:/src" `
     -v darkstore-gomod:/go/pkg/mod `
     -v darkstore-gocache:/root/.cache/go-build `
     -w /src `
+    @dbArgs `
     $Image `
     go test -race "-count=$Count" ./...
 

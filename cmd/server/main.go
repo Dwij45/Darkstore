@@ -9,6 +9,7 @@
 //	RATE_PER_SEC     sustained checkouts per user per second, default 2
 //	RATE_BURST       checkouts a user can make in a burst, default 10
 //	IDEMPOTENCY_TTL  how long a checkout response can be replayed, default 24h
+//	DATABASE_URL     PostgreSQL connection string; unset keeps stock in memory
 package main
 
 import (
@@ -23,9 +24,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"darkstore/internal/api"
 	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
+	"darkstore/internal/pgstore"
 	"darkstore/internal/ratelimit"
 	"darkstore/internal/worker"
 )
@@ -66,8 +70,14 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("IDEMPOTENCY_TTL: %w", err)
 	}
 
-	inv := inventory.NewStore(ttl)
-	seed(inv)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	inv, closeInv, err := openInventory(ctx, log, ttl)
+	if err != nil {
+		return err
+	}
+	defer closeInv()
 
 	tracker := fulfilment.NewTracker()
 	f := &fulfilment.Fulfiller{
@@ -87,9 +97,6 @@ func run(log *slog.Logger) error {
 		st, _ := tracker.Get(orderID)
 		log.Info("order finished", "order_id", orderID, "stage", st.Stage, "rider", st.RiderID)
 	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// Workers get their own context so in-flight orders keep running while
 	// HTTP shuts down, and are only cut off if draining takes too long.
@@ -145,16 +152,44 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
-// seed loads a small catalogue so the API is usable straight away.
-func seed(inv *inventory.Store) {
-	for sku, qty := range map[string]int{
-		"milk-1l":     50,
-		"bread-whole": 20,
-		"eggs-12":     30,
-		"banana-6":    40,
-	} {
-		inv.AddStock(sku, qty)
+// catalogue is loaded on first start so the API is usable straight away.
+var catalogue = map[string]int{
+	"milk-1l":     50,
+	"bread-whole": 20,
+	"eggs-12":     30,
+	"banana-6":    40,
+}
+
+// openInventory returns PostgreSQL-backed stock when DATABASE_URL is set,
+// otherwise in-memory stock. The returned func releases the backend.
+func openInventory(ctx context.Context, log *slog.Logger, ttl time.Duration) (inventory.Inventory, func(), error) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		log.Info("stock backend", "kind", "memory")
+		inv := inventory.AsInventory(inventory.NewStore(ttl))
+		return inv, func() {}, inv.Seed(ctx, catalogue)
 	}
+
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, nil, fmt.Errorf("DATABASE_URL: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	if err := pgstore.Migrate(ctx, pool); err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
+	store := pgstore.New(pool, ttl)
+	store.OnError = func(err error) { log.Error("expire reservations", "err", err) }
+	if err := store.Seed(ctx, catalogue); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("seed: %w", err)
+	}
+	log.Info("stock backend", "kind", "postgres")
+	return store, pool.Close, nil
 }
 
 func envOr(key, def string) string {
