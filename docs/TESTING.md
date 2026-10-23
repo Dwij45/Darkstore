@@ -128,3 +128,21 @@ t~16s  delivered, rider-2
 ### Run 3: graceful shutdown (manual)
 
 Start the server, confirm an order, and press Ctrl+C while it is `out_for_delivery`. Expected: the log shows `shutting down`, then `order finished ... stage=delivered`, then `stopped`, so the in-flight order completes before exit.
+
+## Step 4 — Race detector (whole suite, in Docker)
+
+Date: 2026-10-23
+
+`go test -race` needs CGO and a C compiler, which this Windows machine lacks, so the suite runs in a `golang:1.27` Linux container via `scripts/test-race.ps1`.
+
+```
+powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1
+powershell -ExecutionPolicy Bypass -File scripts/test-race.ps1 -Count 10
+```
+
+| Run | Result |
+|---|---|
+| `go test -race ./...` | PASS in all 4 packages, no data races reported |
+| `go test -race -count=10 ./...` | PASS in all 4 packages (every test, including the 1,000-vs-50 checkout tests, run 10 times) |
+
+The first run took ~7 minutes (image download); later runs take under 30 seconds because modules and build output are cached in Docker volumes.
