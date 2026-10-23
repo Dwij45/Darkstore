@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
 )
 
@@ -40,7 +41,7 @@ func newTestServer(t *testing.T, ttl time.Duration, stock map[string]int) (*Serv
 		}
 	}
 	d := &fakeDispatcher{}
-	return New(inv, d), inv, d
+	return New(inv, d, fulfilment.NewTracker()), inv, d
 }
 
 func do(s *Server, method, path, key, body string) *httptest.ResponseRecorder {
@@ -212,8 +213,12 @@ func TestConfirmDispatchesOrder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if got := decodeOrder(t, rec).Status; got != inventory.StatusConfirmed {
-		t.Errorf("status = %s, want confirmed", got)
+	o := decodeOrder(t, rec)
+	if o.Status != inventory.StatusConfirmed {
+		t.Errorf("status = %s, want confirmed", o.Status)
+	}
+	if o.Fulfilment == nil || o.Fulfilment.Stage != fulfilment.StageQueued {
+		t.Errorf("fulfilment = %+v, want stage queued", o.Fulfilment)
 	}
 	if len(d.ids) != 1 || d.ids[0] != id {
 		t.Errorf("dispatched = %v, want [%s]", d.ids, id)
@@ -229,6 +234,9 @@ func TestConfirmReportsUnavailableQueue(t *testing.T) {
 	id := decodeOrder(t, do(s, "POST", "/checkout", "k", milkx2)).OrderID
 	if rec := do(s, "POST", "/orders/"+id+"/confirm", "", ""); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if o := decodeOrder(t, do(s, "GET", "/orders/"+id, "", "")); o.Fulfilment != nil {
+		t.Errorf("fulfilment = %+v, want none (order was never queued)", o.Fulfilment)
 	}
 }
 

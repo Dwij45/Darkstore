@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"time"
 
+	"darkstore/internal/fulfilment"
 	"darkstore/internal/inventory"
 )
 
@@ -30,14 +31,17 @@ type Dispatcher interface {
 type Server struct {
 	inv      *inventory.Store
 	dispatch Dispatcher
+	tracker  *fulfilment.Tracker
 	idem     *idempotencyCache
 	mux      *http.ServeMux
 }
 
-func New(inv *inventory.Store, dispatch Dispatcher) *Server {
+// New wires the routes. dispatch and tracker may be nil.
+func New(inv *inventory.Store, dispatch Dispatcher, tracker *fulfilment.Tracker) *Server {
 	s := &Server{
 		inv:      inv,
 		dispatch: dispatch,
+		tracker:  tracker,
 		idem:     newIdempotencyCache(),
 		mux:      http.NewServeMux(),
 	}
@@ -60,10 +64,11 @@ type checkoutRequest struct {
 }
 
 type orderResponse struct {
-	OrderID   string           `json:"order_id"`
-	Status    inventory.Status `json:"status"`
-	Items     []inventory.Item `json:"items"`
-	ExpiresAt time.Time        `json:"expires_at"`
+	OrderID    string             `json:"order_id"`
+	Status     inventory.Status   `json:"status"`
+	Items      []inventory.Item   `json:"items"`
+	ExpiresAt  time.Time          `json:"expires_at"`
+	Fulfilment *fulfilment.Status `json:"fulfilment,omitempty"`
 }
 
 type errorResponse struct {
@@ -154,7 +159,7 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 		writeOrderError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toOrder(res))
+	writeJSON(w, http.StatusOK, s.withFulfilment(toOrder(res)))
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
@@ -164,14 +169,32 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.dispatch != nil {
+		// Mark queued before submitting: once submitted, a worker may set
+		// "picking" at any moment and must not be overwritten.
+		if s.tracker != nil {
+			s.tracker.Set(res.ID, fulfilment.Status{Stage: fulfilment.StageQueued})
+		}
 		if err := s.dispatch.Submit(r.Context(), res.ID); err != nil {
+			if s.tracker != nil {
+				s.tracker.Delete(res.ID)
+			}
 			// Payment is confirmed but no worker took the order. Without an
-			// outbox this order stays confirmed and unfulfilled; see README.
+			// outbox this order stays confirmed and unfulfilled; see docs/TESTING.md.
 			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "order confirmed but fulfilment queue is unavailable"})
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, toOrder(res))
+	writeJSON(w, http.StatusOK, s.withFulfilment(toOrder(res)))
+}
+
+func (s *Server) withFulfilment(o orderResponse) orderResponse {
+	if s.tracker == nil {
+		return o
+	}
+	if st, ok := s.tracker.Get(o.OrderID); ok {
+		o.Fulfilment = &st
+	}
+	return o
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
